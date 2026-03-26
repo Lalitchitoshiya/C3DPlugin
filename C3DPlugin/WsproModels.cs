@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using Autodesk.AutoCAD.Geometry;
 
 namespace C3DPlugin
 {
@@ -22,6 +23,124 @@ namespace C3DPlugin
         public string ToNodeId { get; set; }
         public double DiameterMm { get; set; }
         public string Material { get; set; }
+    }
+
+    /// <summary>
+    /// Describes a WSPro graph vertex for post-process fitting placement (degree, diameters, optional deflection).
+    /// </summary>
+    internal sealed class WsproJunctionInfo
+    {
+        public WsproJunctionInfo(
+            string nodeId,
+            Point3d position,
+            int degree,
+            IReadOnlyList<double> diametersMm,
+            string nodeType,
+            double? turnAngleBetweenArmsDegrees)
+        {
+            NodeId = nodeId;
+            Position = position;
+            Degree = degree;
+            DiametersMm = diametersMm;
+            NodeType = nodeType ?? string.Empty;
+            TurnAngleBetweenArmsDegrees = turnAngleBetweenArmsDegrees;
+        }
+
+        public string NodeId { get; }
+        public Point3d Position { get; }
+        public int Degree { get; }
+        public IReadOnlyList<double> DiametersMm { get; }
+        public string NodeType { get; }
+        /// <summary>
+        /// For degree 2, the angle in degrees between the two arms (vectors from this node toward neighbors). Null if unknown.
+        /// </summary>
+        public double? TurnAngleBetweenArmsDegrees { get; }
+
+        /// <summary>
+        /// Builds junction metadata from pipes + nodes. Skips edges with missing endpoints in <paramref name="nodeDict"/>.
+        /// </summary>
+        public static List<WsproJunctionInfo> BuildFrom(
+            IReadOnlyList<WsproPipe> pipes,
+            IReadOnlyDictionary<string, WsproNode> nodeDict)
+        {
+            var incident = new Dictionary<string, List<(WsproPipe Pipe, string OtherId)>>(StringComparer.Ordinal);
+            foreach (var p in pipes)
+            {
+                var from = p.FromNodeId ?? string.Empty;
+                var to = p.ToNodeId ?? string.Empty;
+                if (string.IsNullOrEmpty(from) || string.IsNullOrEmpty(to))
+                    continue;
+                if (!nodeDict.ContainsKey(from) || !nodeDict.ContainsKey(to))
+                    continue;
+
+                if (!incident.TryGetValue(from, out var listFrom))
+                {
+                    listFrom = new List<(WsproPipe, string)>();
+                    incident[from] = listFrom;
+                }
+
+                listFrom.Add((p, to));
+
+                if (!incident.TryGetValue(to, out var listTo))
+                {
+                    listTo = new List<(WsproPipe, string)>();
+                    incident[to] = listTo;
+                }
+
+                listTo.Add((p, from));
+            }
+
+            var result = new List<WsproJunctionInfo>();
+            foreach (var kv in incident)
+            {
+                var nodeId = kv.Key;
+                var inc = kv.Value;
+                if (!nodeDict.TryGetValue(nodeId, out var node))
+                    continue;
+
+                // One entry per adjacent node (parallel pipes share the same neighbor).
+                var byNeighbor = inc
+                    .GroupBy(x => x.OtherId, StringComparer.Ordinal)
+                    .Select(g => g.First())
+                    .ToList();
+
+                var degree = byNeighbor.Count;
+                var diameters = byNeighbor
+                    .Select(x => x.Pipe.DiameterMm)
+                    .Distinct()
+                    .ToList();
+
+                double? angleDeg = null;
+                if (degree == 2)
+                {
+                    var a = byNeighbor[0].OtherId;
+                    var b = byNeighbor[1].OtherId;
+                    if (nodeDict.TryGetValue(a, out var na) && nodeDict.TryGetValue(b, out var nb))
+                    {
+                        var v1 = new Vector3d(na.X - node.X, na.Y - node.Y, na.Z - node.Z);
+                        var v2 = new Vector3d(nb.X - node.X, nb.Y - node.Y, nb.Z - node.Z);
+                        var len = v1.Length * v2.Length;
+                        if (len > 1e-18)
+                        {
+                            var dot = v1.DotProduct(v2) / len;
+                            if (dot > 1.0) dot = 1.0;
+                            if (dot < -1.0) dot = -1.0;
+                            angleDeg = Math.Acos(dot) * 180.0 / Math.PI;
+                        }
+                    }
+                }
+
+                result.Add(new WsproJunctionInfo(
+                    nodeId,
+                    new Point3d(node.X, node.Y, node.Z),
+                    degree,
+                    diameters,
+                    node.Type ?? string.Empty,
+                    angleDeg));
+            }
+
+            return result;
+        }
     }
 
     public static class WsproCsvReader

@@ -1,0 +1,194 @@
+# WSPro Pressure Import Documentation
+
+## Overview
+
+This project imports WSPro water network data into Autodesk Civil 3D as a pressure pipe network.
+
+The current plugin provides these commands:
+
+- `WSPRO_IMPORT_PRESSURE`
+- `WSPRO_DIAG_PARTS`
+- `WSPRO_DIAG_PRESSURE`
+
+Primary code files:
+
+- [WsproImporter.cs](/d:/WSPtoCIVIL/C3DPlugin/C3DPlugin/WsproImporter.cs)
+- [WsproModels.cs](/d:/WSPtoCIVIL/C3DPlugin/C3DPlugin/WsproModels.cs)
+- [myCommands.cs](/d:/WSPtoCIVIL/C3DPlugin/C3DPlugin/myCommands.cs)
+
+## Current Status
+
+Pressure network import is now working in Civil 3D.
+
+During debugging, the main issue was not the CSV data. The actual problem was that Civil 3D returned valid `PressurePartList` and `PressurePartSize` objects, but the plugin initially could not discover usable part sizes and diameter values from the Civil 3D 2026 pressure pipe API surface.
+
+The importer and diagnostics were updated to:
+
+- Prefer the parts list assigned to an existing pressure network in the drawing.
+- Fall back across multiple Civil 3D API shapes when discovering pressure parts.
+- Probe `PressurePartSize` values more broadly instead of assuming only one nominal diameter property exists.
+- Provide better diagnostics for parts lists and part sizes.
+
+## CSV Files
+
+Relevant CSVs in this repo:
+
+- [Pipe_Export_2.csv](/d:/WSPtoCIVIL/C3DPlugin/Pipe_Export_2.csv)
+- [Pipe_Export_2_full.csv](/d:/WSPtoCIVIL/C3DPlugin/Pipe_Export_2_full.csv)
+
+Important point:
+
+- `WSPRO_DIAG_PARTS` does not use the CSV files.
+- If `Pipe sizes found: 0` appears, that is a Civil 3D parts-list / API issue, not a CSV issue.
+
+## Build
+
+Build command used successfully:
+
+```powershell
+$env:DOTNET_CLI_HOME='d:\WSPtoCIVIL\C3DPlugin\.dotnet'
+$env:DOTNET_SKIP_FIRST_TIME_EXPERIENCE='1'
+dotnet build C3DPlugin\C3DPlugin.csproj --no-restore
+```
+
+Latest known build output:
+
+- [C3DPlugin.dll](/d:/WSPtoCIVIL/C3DPlugin/C3DPlugin/bin/Debug/net8.0-windows/C3DPlugin.dll)
+
+Build status at last check:
+
+- `0` errors
+- warnings present, but build completed successfully
+
+## Load Plugin In Civil 3D
+
+1. Open Civil 3D.
+2. Open the target drawing.
+3. Type `NETLOAD`.
+4. Browse to [C3DPlugin.dll](/d:/WSPtoCIVIL/C3DPlugin/C3DPlugin/bin/Debug/net8.0-windows/C3DPlugin.dll).
+5. Select the DLL and click `Open`.
+
+## Commands
+
+### `WSPRO_DIAG_PARTS`
+
+Purpose:
+
+- Finds the active pressure parts list.
+- Reports the runtime type.
+- Probes available pressure part members.
+- Attempts to resolve part-size diameter values.
+
+Use:
+
+1. Type `WSPRO_DIAG_PARTS`.
+2. Review the command line output.
+
+### `WSPRO_IMPORT_PRESSURE`
+
+Purpose:
+
+- Reads WSPro nodes and pipes CSVs.
+- Creates or reuses a Civil 3D pressure network.
+- Matches CSV diameters to Civil 3D pressure parts.
+- Creates line pipes between node coordinates.
+
+Use:
+
+1. Type `WSPRO_IMPORT_PRESSURE`.
+2. Select the WSPro nodes CSV when prompted.
+3. Select the WSPro pipes CSV when prompted.
+
+### `WSPRO_DIAG_PRESSURE`
+
+Purpose:
+
+- Dumps pressure-related API information from the active Civil 3D session.
+
+Use:
+
+1. Type `WSPRO_DIAG_PRESSURE`.
+2. Review the command line output.
+
+## Creating A Manual Pressure Network For Testing
+
+This is useful when validating that the drawing contains a usable pressure parts list.
+
+1. Open a Civil 3D drawing.
+2. Type `CREATEPRESSURENETWORK`.
+3. Choose a network name if prompted.
+4. Choose a parts list if prompted.
+5. Choose a pressure pipe part and size.
+6. Click the first point.
+7. Click the second point.
+8. Press Enter to finish.
+
+Then run:
+
+```text
+WSPRO_DIAG_PARTS
+```
+
+## How To Check Imported Properties In Civil 3D
+
+### Check a single pressure pipe
+
+1. Select an imported pressure pipe in the drawing.
+2. Press `Ctrl+1`.
+3. Review the `Properties` palette.
+
+Typical properties to inspect:
+
+- Network name
+- Part description
+- Size or nominal diameter
+- Start point
+- End point
+- Length
+- Layer
+
+### Check the full network
+
+1. Open `Toolspace`.
+2. Go to the `Prospector` tab.
+3. Expand `Pressure Networks`.
+4. Expand the imported network, typically `WSPro_Import`.
+5. Inspect pipes, fittings, and appurtenances.
+
+## Debugging Notes From This Session
+
+Observed early failure pattern:
+
+- `Read 92 nodes and 117 pipes from WSPro CSVs.`
+- `Created 0 pressure pipes in network 'WSPro_Import'.`
+- `Skipped 113 pipes due to no matching part size.`
+
+This was traced to pressure part discovery and diameter extraction, not to node parsing.
+
+Important findings:
+
+- A `PressurePartList` object could exist even when `Pipe sizes found` still appeared as `0`.
+- `GetParts(...)` could return `PressurePartSize` objects while the plugin still failed to read their diameter.
+- The first styles-root parts list was not always the correct one for the active drawing.
+- Preferring the parts list from an existing pressure network was necessary.
+
+## If Import Fails Again
+
+Check these in order:
+
+1. Confirm the latest DLL is loaded with `NETLOAD`.
+2. Run `WSPRO_DIAG_PARTS`.
+3. Confirm the command reports a valid parts list source.
+4. Confirm pressure part sizes are being resolved.
+5. Then run `WSPRO_IMPORT_PRESSURE`.
+
+If the importer reports skipped pipes due to no matching size:
+
+- verify the active drawing contains a valid pressure pipe parts list
+- verify the selected parts list includes the required pipe sizes
+- compare the imported Civil 3D pipe size against `DIAMETER` values in [Pipe_Export_2.csv](/d:/WSPtoCIVIL/C3DPlugin/Pipe_Export_2.csv)
+
+## Notes
+
+- Documentation reflects the current state of the repo as of 2026-03-17.
+- Civil 3D pressure pipe APIs can vary by version and template content.
