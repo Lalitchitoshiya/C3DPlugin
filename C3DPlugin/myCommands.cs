@@ -103,5 +103,16 @@ namespace C3DPlugin
             Editor ed = doc.Editor;
             WsproImporter.DiagnosePartsList(ed);
         }
+
+        [CommandMethod("WSPro", "WSPRO_DIAG_FITTINGS", CommandFlags.Modal)]
+        public void WsproDiagFittings()
+        {
+            Document doc = AcadApp.DocumentManager.MdiActiveDocument;
+            if (doc == null)
+                return;
+
+            Editor ed = doc.Editor;
+            WsproImporter.DiagnoseFittings(ed);
+        }
     }
 }

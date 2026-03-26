@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using System.Text.RegularExpressions;
 using Autodesk.AutoCAD.ApplicationServices;
 using Autodesk.AutoCAD.DatabaseServices;
 using Autodesk.AutoCAD.EditorInput;
@@ -216,6 +217,7 @@ namespace C3DPlugin
                 int pipeSkippedNoSize = 0;
                 int pipeSkippedMissingNode = 0;
                 var noSizeDiameters = new HashSet<double>();
+                var nodeCreatedPipeCount = new Dictionary<string, int>(StringComparer.Ordinal);
 
                 foreach (var pipe in pipes)
                 {
@@ -243,6 +245,12 @@ namespace C3DPlugin
                             !createdPipeId.IsNull)
                         {
                             pipeCreated++;
+                            var fromId = pipe.FromNodeId ?? string.Empty;
+                            var toId = pipe.ToNodeId ?? string.Empty;
+                            if (!string.IsNullOrEmpty(fromId))
+                                nodeCreatedPipeCount[fromId] = nodeCreatedPipeCount.GetValueOrDefault(fromId) + 1;
+                            if (!string.IsNullOrEmpty(toId))
+                                nodeCreatedPipeCount[toId] = nodeCreatedPipeCount.GetValueOrDefault(toId) + 1;
                         }
                     }
                     catch
@@ -265,6 +273,101 @@ namespace C3DPlugin
                     }
                 }
 
+                PostProcessJunctionFittings(networkId, partsListId, nodeDict, pipes, tr, ed, nodeCreatedPipeCount);
+
+                tr.Commit();
+            }
+        }
+
+        /// <summary>
+        /// Lists pressure fittings in the first pressure network (sample positions and part names).
+        /// </summary>
+        public static void DiagnoseFittings(Editor ed)
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            if (doc == null)
+            {
+                ed.WriteMessage("\nNo active document.");
+                return;
+            }
+
+            var civilDoc = CivilApplication.ActiveDocument;
+            if (civilDoc == null)
+            {
+                ed.WriteMessage("\nNo active Civil 3D document.");
+                return;
+            }
+
+            using (var tr = doc.TransactionManager.StartTransaction())
+            {
+                if (!TryGetExistingPressureNetwork(civilDoc, tr, ed, out ObjectId networkId) || networkId.IsNull)
+                {
+                    ed.WriteMessage("\nNo Pressure Pipe Network found in the drawing. Create or import one first.");
+                    tr.Commit();
+                    return;
+                }
+
+                if (tr.GetObject(networkId, OpenMode.ForRead) is not PressurePipeNetwork network)
+                {
+                    tr.Commit();
+                    return;
+                }
+
+                ed.WriteMessage("\n--- WSPro FITTINGS DIAG ---");
+                ed.WriteMessage($"\nNetwork ObjectId: {networkId}");
+
+                object fittingIdsObj = null;
+                try
+                {
+                    fittingIdsObj = network.GetFittingIds();
+                }
+                catch (Exception ex)
+                {
+                    ed.WriteMessage("\nGetFittingIds failed: " + ex.Message);
+                    tr.Commit();
+                    return;
+                }
+
+                int count = 0;
+                if (fittingIdsObj is IEnumerable enumerableIds)
+                {
+                    foreach (var _ in enumerableIds)
+                        count++;
+                }
+
+                ed.WriteMessage($"\nFitting count: {count}");
+
+                int sample = 0;
+                const int maxSample = 15;
+                if (fittingIdsObj is IEnumerable fittingIds)
+                {
+                    foreach (ObjectId fid in fittingIds)
+                    {
+                        if (fid.IsNull || sample >= maxSample)
+                            break;
+
+                        try
+                        {
+                            if (tr.GetObject(fid, OpenMode.ForRead) is PressurePart part)
+                            {
+                                var pos = part.Position;
+                                var fam = part.PartFamilyName ?? string.Empty;
+                                var desc = part.PartDescription ?? string.Empty;
+                                ed.WriteMessage($"\n  [{sample}] Position=({pos.X:0.###},{pos.Y:0.###},{pos.Z:0.###}) Family={fam} Desc={desc}");
+                                sample++;
+                            }
+                        }
+                        catch
+                        {
+                            // ignore sample failures
+                        }
+                    }
+                }
+
+                if (count > maxSample)
+                    ed.WriteMessage($"\n... ({count - maxSample} more not shown)");
+
+                ed.WriteMessage("\n--- END FITTINGS DIAG ---");
                 tr.Commit();
             }
         }
@@ -292,7 +395,32 @@ namespace C3DPlugin
                     ed.WriteMessage($"\nParts list runtime type: {openedPartsList.GetType().FullName}");
                     DumpPressurePartListMembers(openedPartsList, tr, ed);
                     DumpFirstPressurePartSize(openedPartsList, tr, ed);
+
+                    var fitTypeCandidates = GetPressureFittingPartTypesToQuery(openedPartsList);
+                    var fitTypeNames = fitTypeCandidates.Select(x => x.ToString()).OrderBy(x => x).Take(28).ToList();
+                    ed.WriteMessage($"\nPressurePartType candidates for fittings: {fitTypeCandidates.Count}");
+                    if (fitTypeNames.Count > 0)
+                        ed.WriteMessage($"\n  Types: {string.Join(", ", fitTypeNames)}");
+
+                    var fittingDiameters = new List<double>();
+                    foreach (var fp in GetPressureFittingParts(openedPartsList))
+                    {
+                        if (TryGetPressurePartNominalDiameter(fp, out double fd))
+                            fittingDiameters.Add(fd);
+                    }
+
+                    ed.WriteMessage($"\nFitting part sizes in catalog (API): {fittingDiameters.Count}");
+                    if (fittingDiameters.Count > 0)
+                    {
+                        var uniq = fittingDiameters.Distinct().OrderBy(x => x).Take(30).Select(x => x.ToString("0.###"));
+                        ed.WriteMessage($"\nFitting nominal diameters (sample): {string.Join(", ", uniq)}");
+                    }
+                    else
+                    {
+                        ed.WriteMessage("\nTip: If this is 0, add fitting families/sizes under Toolspace → Pressure Network → Parts Lists (Fittings tab), or pick a template whose catalog includes elbows/tees for your diameters.");
+                    }
                 }
+
                 ed.WriteMessage($"\nPipe sizes found: {sizes.Count}");
                 if (sizes.Count > 0)
                 {
@@ -300,6 +428,7 @@ namespace C3DPlugin
                     ed.WriteMessage($"\nMin/Max nominal diameter: {ordered.First():0.###} / {ordered.Last():0.###}");
                     ed.WriteMessage($"\nFirst 30 sizes: {string.Join(", ", ordered.Take(30).Select(x => x.ToString("0.###")))}");
                 }
+
                 ed.WriteMessage($"\n--- END PARTS DIAG ---");
                 tr.Commit();
             }
@@ -957,6 +1086,766 @@ namespace C3DPlugin
             }
 
             ed.WriteMessage("\nFailed to create pipe (no compatible AddLinePipe overload found).");
+            return false;
+        }
+
+        // Civil 3D does not insert fittings when pipes are created only via API (AddLinePipe).
+        // Fittings appear only after AddFitting(...) or from Pressure Plan Layout / other network tools.
+
+        private const double DefaultJunctionFittingTolerance = 0.01;
+        private const double StraightCouplingAngleDegreesMin = 165.0;
+
+        private enum WsproJunctionFittingKind
+        {
+            Tee,
+            Elbow,
+            Coupling,
+            Cap,
+            Cross,
+            Generic
+        }
+
+        private static void PostProcessJunctionFittings(
+            ObjectId networkId,
+            ObjectId partsListId,
+            IReadOnlyDictionary<string, WsproNode> nodeDict,
+            IReadOnlyList<WsproPipe> pipes,
+            Transaction tr,
+            Editor ed,
+            IReadOnlyDictionary<string, int> nodeCreatedPipeCount)
+        {
+            if (networkId.IsNull || partsListId.IsNull || tr == null || ed == null)
+                return;
+
+            if (tr.GetObject(networkId, OpenMode.ForRead) is not PressurePipeNetwork network)
+                return;
+
+            int fittingsAdded = 0;
+            int junctionsSkippedHasFitting = 0;
+            int junctionsSkippedLowDegree = 0;
+            int junctionsSkippedNoCatalog = 0;
+            int junctionsSkippedAddFailed = 0;
+            var noCatalogReasons = new Dictionary<string, int>(StringComparer.Ordinal);
+            var addFailedReasons = new Dictionary<string, int>(StringComparer.Ordinal);
+
+            var existingFittingPoints = CollectFittingPositions(network, tr);
+            var junctions = WsproJunctionInfo.BuildFrom(pipes, nodeDict);
+
+            foreach (var j in junctions)
+            {
+                if (j.Degree < 2)
+                {
+                    junctionsSkippedLowDegree++;
+                    continue;
+                }
+
+                if (nodeCreatedPipeCount.GetValueOrDefault(j.NodeId) < 2)
+                {
+                    junctionsSkippedLowDegree++;
+                    continue;
+                }
+
+                if (PointWithinAnyFitting(j.Position, existingFittingPoints, DefaultJunctionFittingTolerance))
+                {
+                    junctionsSkippedHasFitting++;
+                    continue;
+                }
+
+                var kind = ResolveJunctionFittingKind(j);
+                var diameterMm = SelectPrimaryDiameterMm(j.DiametersMm);
+                if (diameterMm <= 0.0)
+                {
+                    junctionsSkippedNoCatalog++;
+                    BumpReason(noCatalogReasons, $"invalid diameter @ node {j.NodeId}");
+                    continue;
+                }
+
+                if (!TryResolveFittingPartSize(partsListId, tr, diameterMm, kind, out PressurePartSize fittingSize, out WsproJunctionFittingKind resolvedKind))
+                {
+                    junctionsSkippedNoCatalog++;
+                    BumpReason(noCatalogReasons, $"{kind} {diameterMm:0} mm (no catalog match)");
+                    continue;
+                }
+
+                if (!TryCreateFitting(networkId, tr, fittingSize, j.Position, out ObjectId newFittingId) ||
+                    newFittingId.IsNull)
+                {
+                    junctionsSkippedAddFailed++;
+                    BumpReason(addFailedReasons, $"{resolvedKind} {diameterMm:0} mm");
+                    continue;
+                }
+
+                fittingsAdded++;
+                existingFittingPoints.Add(j.Position);
+            }
+
+            ed.WriteMessage($"\nPost-process fittings: added {fittingsAdded}.");
+            if (junctionsSkippedHasFitting > 0)
+                ed.WriteMessage($"\n  Skipped {junctionsSkippedHasFitting} junction(s) (fitting already near node).");
+            if (junctionsSkippedLowDegree > 0)
+                ed.WriteMessage($"\n  Skipped {junctionsSkippedLowDegree} junction(s) (need degree>=2 and at least 2 pipes created at node).");
+            if (junctionsSkippedNoCatalog > 0)
+            {
+                ed.WriteMessage($"\n  Skipped {junctionsSkippedNoCatalog} junction(s) (no matching fitting part size).");
+                DumpReasonSamples(ed, "    No catalog examples", noCatalogReasons, 10);
+            }
+            if (junctionsSkippedAddFailed > 0)
+            {
+                ed.WriteMessage($"\n  Skipped {junctionsSkippedAddFailed} junction(s) (AddFitting failed).");
+                DumpReasonSamples(ed, "    AddFitting failed examples", addFailedReasons, 10);
+            }
+        }
+
+        private static void BumpReason(Dictionary<string, int> dict, string key)
+        {
+            if (dict == null || string.IsNullOrEmpty(key))
+                return;
+            dict[key] = dict.GetValueOrDefault(key) + 1;
+        }
+
+        private static void DumpReasonSamples(Editor ed, string title, Dictionary<string, int> reasons, int maxLines)
+        {
+            if (ed == null || reasons == null || reasons.Count == 0)
+                return;
+            ed.WriteMessage($"\n{title}:");
+            foreach (var kv in reasons.OrderByDescending(x => x.Value).Take(maxLines))
+                ed.WriteMessage($"\n      [{kv.Value}x] {kv.Key}");
+        }
+
+        /// <summary>
+        /// Prefer part matching resolved junction kind; then try common kinds; then any fitting at nominal diameter.
+        /// </summary>
+        private static bool TryResolveFittingPartSize(
+            ObjectId partsListId,
+            Transaction tr,
+            double diameterMm,
+            WsproJunctionFittingKind primaryKind,
+            out PressurePartSize partSize,
+            out WsproJunctionFittingKind resolvedKind)
+        {
+            partSize = null;
+            resolvedKind = primaryKind;
+
+            var tryKinds = new List<WsproJunctionFittingKind> { primaryKind };
+            foreach (var k in new[]
+                     {
+                         WsproJunctionFittingKind.Tee,
+                         WsproJunctionFittingKind.Coupling,
+                         WsproJunctionFittingKind.Elbow,
+                         WsproJunctionFittingKind.Cross,
+                         WsproJunctionFittingKind.Cap
+                     })
+            {
+                if (!tryKinds.Contains(k))
+                    tryKinds.Add(k);
+            }
+
+            foreach (var k in tryKinds)
+            {
+                if (TryFindFittingPartSize(partsListId, tr, diameterMm, k, out partSize))
+                {
+                    resolvedKind = k;
+                    return true;
+                }
+            }
+
+            if (TryFindAnyFittingPartSizeAtDiameter(partsListId, tr, diameterMm, out partSize))
+            {
+                resolvedKind = WsproJunctionFittingKind.Generic;
+                return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Diameter-only match among catalog fitting parts (no keyword), slightly looser tolerance than kind-specific search.
+        /// </summary>
+        private static bool TryFindAnyFittingPartSizeAtDiameter(
+            ObjectId partsListId,
+            Transaction tr,
+            double diameterMm,
+            out PressurePartSize partSize)
+        {
+            partSize = null;
+            if (partsListId.IsNull || diameterMm <= 0.0)
+                return false;
+
+            if (!TryOpenPressurePartList(partsListId, tr, out PressurePartList partsList))
+                return false;
+
+            var targets = new[]
+            {
+                diameterMm,
+                diameterMm / 25.4,
+                diameterMm / 1000.0
+            };
+
+            const double relativeTol = 0.30;
+            double bestRel = double.MaxValue;
+            PressurePartSize bestPart = null;
+
+            foreach (var candidate in GetPressureFittingParts(partsList))
+            {
+                if (!TryBestRelativeErrorForFittingMm(candidate, diameterMm, targets, out double rel))
+                    continue;
+
+                if (rel < bestRel)
+                {
+                    bestRel = rel;
+                    bestPart = candidate;
+                }
+            }
+
+            if (bestPart != null && bestRel <= relativeTol)
+            {
+                partSize = bestPart;
+                return true;
+            }
+
+            return false;
+        }
+
+        private static List<Point3d> CollectFittingPositions(PressurePipeNetwork network, Transaction tr)
+        {
+            var list = new List<Point3d>();
+            if (network == null || tr == null)
+                return list;
+
+            object fittingIdsObj = null;
+            try
+            {
+                fittingIdsObj = network.GetFittingIds();
+            }
+            catch
+            {
+                return list;
+            }
+
+            if (fittingIdsObj is not IEnumerable fittingIds)
+                return list;
+
+            foreach (ObjectId fid in fittingIds)
+            {
+                if (fid.IsNull)
+                    continue;
+                try
+                {
+                    if (tr.GetObject(fid, OpenMode.ForRead) is PressurePart part)
+                        list.Add(part.Position);
+                }
+                catch
+                {
+                    // ignore
+                }
+            }
+
+            return list;
+        }
+
+        private static bool PointWithinAnyFitting(Point3d p, IReadOnlyList<Point3d> fittingPoints, double tolerance)
+        {
+            if (fittingPoints == null || fittingPoints.Count == 0)
+                return false;
+
+            foreach (var q in fittingPoints)
+            {
+                if (p.DistanceTo(q) <= tolerance)
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static double SelectPrimaryDiameterMm(IReadOnlyList<double> diametersMm)
+        {
+            if (diametersMm == null || diametersMm.Count == 0)
+                return 0.0;
+
+            return diametersMm
+                .GroupBy(d => d)
+                .OrderByDescending(g => g.Count())
+                .First()
+                .Key;
+        }
+
+        private static WsproJunctionFittingKind ResolveJunctionFittingKind(WsproJunctionInfo j)
+        {
+            var t = j.NodeType ?? string.Empty;
+            if (t.IndexOf("tee", StringComparison.OrdinalIgnoreCase) >= 0)
+                return WsproJunctionFittingKind.Tee;
+            if (t.IndexOf("cross", StringComparison.OrdinalIgnoreCase) >= 0)
+                return WsproJunctionFittingKind.Cross;
+            if (t.IndexOf("elbow", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                t.IndexOf("bend", StringComparison.OrdinalIgnoreCase) >= 0)
+                return WsproJunctionFittingKind.Elbow;
+            if (t.IndexOf("cap", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                t.IndexOf("plug", StringComparison.OrdinalIgnoreCase) >= 0)
+                return WsproJunctionFittingKind.Cap;
+            if (t.IndexOf("coupl", StringComparison.OrdinalIgnoreCase) >= 0)
+                return WsproJunctionFittingKind.Coupling;
+
+            if (j.Degree >= 3)
+                return WsproJunctionFittingKind.Tee;
+
+            if (j.Degree == 2 && j.TurnAngleBetweenArmsDegrees.HasValue)
+            {
+                var ang = j.TurnAngleBetweenArmsDegrees.Value;
+                if (ang >= StraightCouplingAngleDegreesMin)
+                    return WsproJunctionFittingKind.Coupling;
+                return WsproJunctionFittingKind.Elbow;
+            }
+
+            return WsproJunctionFittingKind.Generic;
+        }
+
+        private static bool TryFindFittingPartSize(
+            ObjectId partsListId,
+            Transaction tr,
+            double diameterMm,
+            WsproJunctionFittingKind kind,
+            out PressurePartSize partSize)
+        {
+            partSize = null;
+            if (partsListId.IsNull || diameterMm <= 0.0)
+                return false;
+
+            if (!TryOpenPressurePartList(partsListId, tr, out PressurePartList partsList))
+                return false;
+
+            var targets = new[]
+            {
+                diameterMm,
+                diameterMm / 25.4,
+                diameterMm / 1000.0
+            };
+
+            // Looser than pipe matching (catalog / API units vary more for fittings).
+            const double relativeTol = 0.22;
+            var candidates = new List<(PressurePartSize Part, double RelErr, int KeywordScore)>();
+
+            foreach (var candidate in GetPressureFittingParts(partsList))
+            {
+                if (!TryBestRelativeErrorForFittingMm(candidate, diameterMm, targets, out double bestRel))
+                    continue;
+
+                if (bestRel > relativeTol)
+                    continue;
+
+                var text = GetPressurePartSizeSearchText(candidate);
+                int score = ScoreFittingKeywordMatch(text, kind);
+                candidates.Add((candidate, bestRel, score));
+            }
+
+            if (candidates.Count == 0)
+                return false;
+
+            var ordered = candidates
+                .OrderBy(x => x.RelErr)
+                .ThenByDescending(x => x.KeywordScore)
+                .ToList();
+
+            var bestScore = ordered[0].KeywordScore;
+            if (bestScore > 0)
+            {
+                partSize = ordered.First(x => x.KeywordScore == bestScore).Part;
+                return partSize != null;
+            }
+
+            partSize = ordered[0].Part;
+            return partSize != null;
+        }
+
+        private static int ScoreFittingKeywordMatch(string text, WsproJunctionFittingKind kind)
+        {
+            if (string.IsNullOrEmpty(text))
+                return 0;
+
+            text = text.ToLowerInvariant();
+            string[] keys = kind switch
+            {
+                WsproJunctionFittingKind.Tee => new[] { "tee", "tee ", " wye", "wye", "branch", "3-way", "3 way", "triple" },
+                WsproJunctionFittingKind.Cross => new[] { "cross", "crossing" },
+                WsproJunctionFittingKind.Elbow => new[] { "elbow", "bend", "deflection", "90", "45", "22" },
+                WsproJunctionFittingKind.Coupling => new[] { "coupling", "coupler", "socket", "connector" },
+                WsproJunctionFittingKind.Cap => new[] { "cap", "plug", "end cap" },
+                WsproJunctionFittingKind.Generic => Array.Empty<string>(),
+                _ => Array.Empty<string>()
+            };
+
+            int score = 0;
+            foreach (var k in keys)
+            {
+                if (text.IndexOf(k, StringComparison.Ordinal) >= 0)
+                    score += 2;
+            }
+
+            return score;
+        }
+
+        private static string GetPressurePartSizeSearchText(PressurePartSize size)
+        {
+            if (size == null)
+                return string.Empty;
+
+            var parts = new List<string>();
+            try
+            {
+                parts.Add(size.ToString());
+            }
+            catch
+            {
+                // ignore
+            }
+
+            foreach (var prop in size.GetType().GetProperties(BindingFlags.Instance | BindingFlags.Public))
+            {
+                if (prop.GetIndexParameters().Length != 0)
+                    continue;
+                if (prop.PropertyType != typeof(string))
+                    continue;
+                if (prop.Name.IndexOf("name", StringComparison.OrdinalIgnoreCase) < 0 &&
+                    prop.Name.IndexOf("desc", StringComparison.OrdinalIgnoreCase) < 0 &&
+                    prop.Name.IndexOf("family", StringComparison.OrdinalIgnoreCase) < 0 &&
+                    prop.Name.IndexOf("part", StringComparison.OrdinalIgnoreCase) < 0)
+                    continue;
+
+                try
+                {
+                    var v = prop.GetValue(size, null) as string;
+                    if (!string.IsNullOrWhiteSpace(v))
+                        parts.Add(v);
+                }
+                catch
+                {
+                    // ignored
+                }
+            }
+
+            return string.Join(" ", parts);
+        }
+
+        /// <summary>
+        /// Line pipe only — never used as junction fitting via AddFitting.
+        /// </summary>
+        private static bool IsExcludedFromJunctionFittingsPartsList(PressurePartType v)
+        {
+            var s = v.ToString();
+            if (string.Equals(s, "PressurePipe", StringComparison.OrdinalIgnoreCase))
+                return true;
+            if (s.IndexOf("Appurtenance", StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+            return false;
+        }
+
+        /// <summary>
+        /// Enum name contains "Fitting" (e.g. PressurePipeFitting). Excludes pipe and appurtenances.
+        /// </summary>
+        private static bool IsPressureFittingPartType(PressurePartType v)
+        {
+            if (IsExcludedFromJunctionFittingsPartsList(v))
+                return false;
+            return v.ToString().IndexOf("Fitting", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        /// <summary>
+        /// Civil often names types "Elbow", "Tee", "Coupling" with no "Fitting" substring — still junction parts.
+        /// </summary>
+        private static bool IsLikelyFittingPartSubtypeByEnumName(PressurePartType v)
+        {
+            if (IsExcludedFromJunctionFittingsPartsList(v))
+                return false;
+
+            var s = v.ToString();
+            string[] keys =
+            {
+                "Elbow", "Tee", "Cross", "Coupling", "Coupler", "Bend", "Cap", "Wye",
+                "Reducer", "Flange", "Adapter", "Branch", "Union", "Socket", "Lateral"
+            };
+
+            foreach (var k in keys)
+            {
+                if (s.IndexOf(k, StringComparison.OrdinalIgnoreCase) >= 0)
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryCoerceToPressurePartType(object o, out PressurePartType pt)
+        {
+            pt = default;
+            if (o == null)
+                return false;
+
+            if (o is PressurePartType direct)
+            {
+                pt = direct;
+                return true;
+            }
+
+            try
+            {
+                if (o.GetType() == typeof(PressurePartType))
+                {
+                    pt = (PressurePartType)o;
+                    return true;
+                }
+            }
+            catch
+            {
+                // ignored
+            }
+
+            try
+            {
+                switch (o)
+                {
+                    case int i when Enum.IsDefined(typeof(PressurePartType), i):
+                        pt = (PressurePartType)i;
+                        return true;
+                    case long l when l >= int.MinValue && l <= int.MaxValue && Enum.IsDefined(typeof(PressurePartType), (int)l):
+                        pt = (PressurePartType)(int)l;
+                        return true;
+                }
+            }
+            catch
+            {
+                // ignored
+            }
+
+            return Enum.TryParse(o.ToString(), true, out pt);
+        }
+
+        /// <summary>
+        /// Catalog may advertise part types via GetPartTypes() rather than every enum value.
+        /// </summary>
+        private static List<PressurePartType> GetPartTypesFromCatalog(PressurePartList partsList)
+        {
+            var list = new List<PressurePartType>();
+            if (partsList == null)
+                return list;
+
+            try
+            {
+                var m = partsList.GetType().GetMethod("GetPartTypes", BindingFlags.Instance | BindingFlags.Public, null, Type.EmptyTypes, null);
+                if (m == null)
+                    return list;
+                var result = m.Invoke(partsList, null);
+                if (result is not IEnumerable enumerable)
+                    return list;
+                foreach (var o in enumerable)
+                {
+                    if (TryCoerceToPressurePartType(o, out var pt))
+                        list.Add(pt);
+                }
+            }
+            catch
+            {
+                // ignored
+            }
+
+            return list;
+        }
+
+        /// <summary>
+        /// All <see cref="PressurePartType"/> values to query for <see cref="PressurePartSize"/> rows used with <c>AddFitting</c>.
+        /// </summary>
+        private static HashSet<PressurePartType> GetPressureFittingPartTypesToQuery(PressurePartList partsList)
+        {
+            var typesToQuery = new HashSet<PressurePartType>();
+
+            foreach (var v in GetPartTypesFromCatalog(partsList))
+            {
+                if (!IsExcludedFromJunctionFittingsPartsList(v))
+                    typesToQuery.Add(v);
+            }
+
+            foreach (PressurePartType v in Enum.GetValues(typeof(PressurePartType)))
+            {
+                if (IsPressureFittingPartType(v) || IsLikelyFittingPartSubtypeByEnumName(v))
+                    typesToQuery.Add(v);
+            }
+
+            return typesToQuery;
+        }
+
+        private static IEnumerable<PressurePartSize> GetPressureFittingParts(PressurePartList partsList)
+        {
+            if (partsList == null)
+                yield break;
+
+            var seen = new HashSet<int>();
+
+            foreach (var v in GetPressureFittingPartTypesToQuery(partsList))
+            {
+                List<PressurePartSize> parts = null;
+                try
+                {
+                    parts = partsList.GetParts(v);
+                }
+                catch
+                {
+                    continue;
+                }
+
+                if (parts == null)
+                    continue;
+
+                foreach (var part in parts)
+                {
+                    if (TryRememberPressurePartSize(part, seen))
+                        yield return part;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Hypotheses for nominal size from API (mm, m, inches, or raw).
+        /// </summary>
+        private static IEnumerable<double> NominalMmHypotheses(double raw)
+        {
+            if (raw <= 0)
+                yield break;
+
+            yield return raw;
+            if (raw >= 0.02 && raw < 5.0)
+                yield return raw * 1000.0;
+            if (raw >= 3.0 && raw <= 80.0)
+                yield return raw * 25.4;
+        }
+
+        /// <summary>
+        /// Parse catalog strings like "300 mm", "DN300", "300mm x 300mm".
+        /// </summary>
+        private static bool TryParseMmFromCatalogText(string text, out double mm)
+        {
+            mm = 0.0;
+            if (string.IsNullOrWhiteSpace(text))
+                return false;
+
+            var t = text.Trim();
+            if (Regex.IsMatch(t, @"dn\s*\d", RegexOptions.IgnoreCase))
+            {
+                var m = Regex.Match(t, @"dn\s*(\d{2,4})\b", RegexOptions.IgnoreCase);
+                if (m.Success && double.TryParse(m.Groups[1].Value, System.Globalization.NumberStyles.Float,
+                        System.Globalization.CultureInfo.InvariantCulture, out mm))
+                    return mm >= 15 && mm <= 5000;
+            }
+
+            var mmMatch = Regex.Match(t, @"(\d{2,4}(?:\.\d+)?)\s*mm\b", RegexOptions.IgnoreCase);
+            if (mmMatch.Success && double.TryParse(mmMatch.Groups[1].Value, System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out mm))
+                return mm >= 15 && mm <= 5000;
+
+            var xMatch = Regex.Match(t, @"(\d{2,4})\s*[xX]\s*(\d{2,4})\s*mm", RegexOptions.IgnoreCase);
+            if (xMatch.Success)
+            {
+                if (double.TryParse(xMatch.Groups[1].Value, System.Globalization.NumberStyles.Float,
+                        System.Globalization.CultureInfo.InvariantCulture, out var a) &&
+                    double.TryParse(xMatch.Groups[2].Value, System.Globalization.NumberStyles.Float,
+                        System.Globalization.CultureInfo.InvariantCulture, out var b))
+                {
+                    mm = Math.Max(a, b);
+                    return mm >= 15 && mm <= 5000;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool TryBestRelativeErrorForFittingMm(
+            PressurePartSize candidate,
+            double diameterMm,
+            double[] targets,
+            out double bestRel)
+        {
+            bestRel = double.MaxValue;
+            if (candidate == null || targets == null)
+                return false;
+
+            var text = GetPressurePartSizeSearchText(candidate);
+            bool any = false;
+
+            if (TryGetPressurePartNominalDiameter(candidate, out double raw) && raw > 0)
+            {
+                foreach (var candMm in NominalMmHypotheses(raw))
+                {
+                    foreach (var t in targets)
+                    {
+                        if (t <= 0)
+                            continue;
+                        double rel = Math.Abs(candMm - t) / t;
+                        if (rel < bestRel)
+                            bestRel = rel;
+                        any = true;
+                    }
+                }
+            }
+
+            if (TryParseMmFromCatalogText(text, out double parsedMm))
+            {
+                foreach (var t in targets)
+                {
+                    if (t <= 0)
+                        continue;
+                    double rel = Math.Abs(parsedMm - t) / t;
+                    if (rel < bestRel)
+                        bestRel = rel;
+                    any = true;
+                }
+            }
+
+            return any && bestRel < double.MaxValue;
+        }
+
+        private static bool TryCreateFitting(ObjectId networkId, Transaction tr, PressurePartSize partSize, Point3d location, out ObjectId fittingId)
+        {
+            fittingId = ObjectId.Null;
+            if (networkId.IsNull || partSize == null)
+                return false;
+
+            if (tr.GetObject(networkId, OpenMode.ForWrite) is not PressurePipeNetwork network)
+                return false;
+
+            try
+            {
+                fittingId = network.AddFitting(location, partSize);
+                return !fittingId.IsNull;
+            }
+            catch
+            {
+                // fall through to reflection fallback
+            }
+
+            var methods = network.GetType().GetMethods(BindingFlags.Instance | BindingFlags.Public)
+                .Where(m => m.Name.Equals("AddFitting", StringComparison.OrdinalIgnoreCase))
+                .OrderBy(m => m.GetParameters().Length)
+                .ToList();
+
+            foreach (var m in methods)
+            {
+                var ps = m.GetParameters();
+                try
+                {
+                    if (ps.Length == 2 &&
+                        ps[0].ParameterType == typeof(Point3d) &&
+                        ps[1].ParameterType == typeof(PressurePartSize))
+                    {
+                        var result = m.Invoke(network, new object[] { location, partSize });
+                        if (result is ObjectId oid && !oid.IsNull)
+                        {
+                            fittingId = oid;
+                            return true;
+                        }
+                    }
+                }
+                catch
+                {
+                    // try next overload
+                }
+            }
+
             return false;
         }
 
