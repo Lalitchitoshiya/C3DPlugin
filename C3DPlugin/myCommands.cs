@@ -93,6 +93,33 @@ namespace C3DPlugin
             WsproImporter.DiagnosePressureApi(ed);
         }
 
+        [CommandMethod("WSPro", "WSPRO_EXPORT_PRESSURE", CommandFlags.Modal)]
+        public void WsproExportPressure()
+        {
+            Document doc = AcadApp.DocumentManager.MdiActiveDocument;
+            if (doc == null)
+                return;
+
+            Editor ed = doc.Editor;
+
+            // Prompt for output folder
+            var folderRes = ed.GetString("\nEnter output folder path (or press Enter for drawing folder): ");
+            if (folderRes.Status != PromptStatus.OK && folderRes.Status != PromptStatus.None)
+                return;
+
+            string outputFolder = folderRes.StringResult;
+            if (string.IsNullOrWhiteSpace(outputFolder))
+            {
+                // Default to same folder as the drawing
+                string dwgPath = doc.Name;
+                outputFolder = System.IO.Path.GetDirectoryName(dwgPath);
+                if (string.IsNullOrEmpty(outputFolder))
+                    outputFolder = System.IO.Path.GetTempPath();
+            }
+
+            WsproExporter.ExportNetwork(ed, outputFolder);
+        }
+
         [CommandMethod("WSPro", "WSPRO_DIAG_PARTS", CommandFlags.Modal)]
         public void WsproDiagParts()
         {
