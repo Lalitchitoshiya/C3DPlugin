@@ -31,6 +31,10 @@
 			<HintPath>C:\Program Files\Autodesk\AutoCAD 2026\ACA\AecBaseMgd.dll</HintPath>
 			<Private>false</Private>
 		</Reference>
+		<Reference Include="AecPropDataMgd">
+			<HintPath>C:\Program Files\Autodesk\AutoCAD 2026\ACA\AecPropDataMgd.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
 		<Reference Include="CaMgdContentData">
 			<HintPath>C:\Program Files\Autodesk\AutoCAD 2026\C3D\CaMgdContentData.dll</HintPath>
 		</Reference>

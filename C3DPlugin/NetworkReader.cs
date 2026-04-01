@@ -92,6 +92,10 @@ namespace C3DPlugin
                     DsIl = WsproCsvRecord.Fmt(pipe.EndPoint.Z - (pipe.DiameterMm / 2000.0)),
                 };
 
+                // Read PropertySet values for round-trip (simulation data from previous import)
+                if (!pipe.EntityId.IsNull)
+                    PropertySetManager.ReadValues(pipe.EntityId, tr, record);
+
                 records.Add(record);
             }
 
@@ -102,6 +106,7 @@ namespace C3DPlugin
 
         private class RawPipe
         {
+            public ObjectId EntityId;
             public Point3d StartPoint;
             public Point3d EndPoint;
             public double DiameterMm;
@@ -147,6 +152,7 @@ namespace C3DPlugin
 
                     pipes.Add(new RawPipe
                     {
+                        EntityId = pipeId,
                         StartPoint = startPt,
                         EndPoint = endPt,
                         DiameterMm = dia,

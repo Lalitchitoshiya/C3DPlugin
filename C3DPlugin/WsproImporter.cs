@@ -162,16 +162,33 @@ namespace C3DPlugin
 
             List<WsproNode> nodes;
             List<WsproPipe> pipes;
+            List<WsproCsvRecord> fullRecords = null;
 
             try
             {
                 nodes = WsproCsvReader.ReadNodes(nodesCsv);
                 pipes = WsproCsvReader.ReadPipes(pipesCsv);
+
+                // Also read full 30-column records for PropertySet population
+                try { fullRecords = WsproCsvReader.ReadFullRecords(pipesCsv); }
+                catch { /* Non-critical: PropertySets just won't be populated */ }
             }
             catch (Exception ex)
             {
                 ed.WriteMessage("\nFailed to read CSV files: " + ex.Message);
                 return;
+            }
+
+            // Build lookup: (FromNodeId, ToNodeId) → full record for PropertySet data
+            var recordLookup = new Dictionary<string, WsproCsvRecord>();
+            if (fullRecords != null)
+            {
+                foreach (var r in fullRecords)
+                {
+                    string key = $"{r.UsId}|{r.DsId}";
+                    if (!recordLookup.ContainsKey(key))
+                        recordLookup[key] = r;
+                }
             }
 
             if (nodes.Count == 0 || pipes.Count == 0)
@@ -184,6 +201,13 @@ namespace C3DPlugin
 
             using (var tr = doc.TransactionManager.StartTransaction())
             {
+                // Ensure WSPro PropertySet definition exists for simulation data
+                ObjectId propSetDefId = ObjectId.Null;
+                if (fullRecords != null && fullRecords.Count > 0)
+                {
+                    propSetDefId = PropertySetManager.EnsureDefinition(doc.Database, tr, ed);
+                }
+
                 if (!TryGetFirstPartsListId(civilDoc, tr, ed, out ObjectId partsListId))
                 {
                     tr.Commit();
@@ -264,6 +288,14 @@ namespace C3DPlugin
                             if (!nodeDirections.ContainsKey(pipe.ToNodeId))
                                 nodeDirections[pipe.ToNodeId] = new List<Vector3d>();
                             nodeDirections[pipe.ToNodeId].Add(-dir); // reverse direction at the other end
+
+                            // Attach WSPro PropertySet with simulation data
+                            if (!propSetDefId.IsNull)
+                            {
+                                string lookupKey = $"{pipe.FromNodeId}|{pipe.ToNodeId}";
+                                if (recordLookup.TryGetValue(lookupKey, out var csvRecord))
+                                    PropertySetManager.AttachAndPopulate(createdPipeId, propSetDefId, tr, csvRecord);
+                            }
                         }
                     }
                     catch

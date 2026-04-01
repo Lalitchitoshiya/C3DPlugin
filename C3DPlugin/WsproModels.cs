@@ -139,6 +139,104 @@ namespace C3DPlugin
             return pipes;
         }
 
+        /// <summary>
+        /// Reads all 30 columns from a WSPro pipe CSV into WsproCsvRecord objects.
+        /// Used by the importer to preserve simulation data for PropertySets.
+        /// </summary>
+        public static List<WsproCsvRecord> ReadFullRecords(string csvPath)
+        {
+            if (!File.Exists(csvPath))
+                throw new FileNotFoundException("Pipes CSV not found.", csvPath);
+
+            var records = new List<WsproCsvRecord>();
+            using (var fs = new FileStream(csvPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var reader = new StreamReader(fs))
+            {
+                if (reader.EndOfStream) return records;
+                var headerLine = reader.ReadLine();
+                if (headerLine == null) return records;
+
+                var headers = SplitCsvLine(headerLine);
+
+                int iUsIl = IndexOf(headers, "US_IL", "US Invert Level");
+                int iDsIl = IndexOf(headers, "DS_IL", "DS Invert Level");
+                int iDiam = IndexOf(headers, "DIAMETER", "Diameter");
+                int iMat = IndexOf(headers, "MATERIAL", "Material");
+                int iPresClass = IndexOf(headers, "PRES_CLASS", "Pressure Class");
+                int iMaxPres = IndexOf(headers, "MAX_PRES", "Max Pressure");
+                int iMaxVel = IndexOf(headers, "MAX_VEL", "Max Velocity");
+                int iSurgeMax = IndexOf(headers, "SURGE_MAX", "Surge Max");
+                int iSurgeMin = IndexOf(headers, "SURGE_MIN", "Surge Min");
+                int iUsId = IndexOf(headers, "US_ID", "From Node ID");
+                int iDsId = IndexOf(headers, "DS_ID", "To Node ID");
+                int iElevUs = IndexOf(headers, "ELEVATION_US", "Elevation US");
+                int iElevDs = IndexOf(headers, "ELEVATION_DS", "Elevation DS");
+                int iRough = IndexOf(headers, "ROUGHNESS", "Roughness");
+                int iLen = IndexOf(headers, "LENGTH", "Length");
+                int iUsX = IndexOf(headers, "US_X", "US X");
+                int iUsY = IndexOf(headers, "US_Y", "US Y");
+                int iDsX = IndexOf(headers, "DS_X", "DS X");
+                int iDsY = IndexOf(headers, "DS_Y", "DS Y");
+                int iVerts = IndexOf(headers, "VERTICES", "Vertices");
+                int iPipeId = IndexOf(headers, "PIPE_ID", "Suffix");
+                int iSysType = IndexOf(headers, "SYSTEM_TYPE", "System Type");
+                int iStatus = IndexOf(headers, "PIPE_STATUS", "Pipe Status");
+                int iLining = IndexOf(headers, "LINING", "Lining");
+                int iJoint = IndexOf(headers, "JOINT_TYPE", "Joint Type");
+                int iYear = IndexOf(headers, "INSTALL_YEAR", "Install Year");
+                int iVelFlag = IndexOf(headers, "VELOCITY_FLAG", "Velocity Flag");
+                int iSurgeFlag = IndexOf(headers, "SURGE_FLAG", "Surge Flag");
+                int iPnClass = IndexOf(headers, "CIVIL3D_PN_CLASS", "PN Class");
+                int iNotes = IndexOf(headers, "NOTES", "Notes");
+
+                while (!reader.EndOfStream)
+                {
+                    var line = reader.ReadLine();
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+
+                    var cols = SplitCsvLine(line);
+                    var r = new WsproCsvRecord
+                    {
+                        UsIl = GetString(cols, iUsIl),
+                        DsIl = GetString(cols, iDsIl),
+                        Diameter = GetString(cols, iDiam),
+                        Material = GetString(cols, iMat),
+                        PresClass = GetString(cols, iPresClass),
+                        MaxPres = GetString(cols, iMaxPres),
+                        MaxVel = GetString(cols, iMaxVel),
+                        SurgeMax = GetString(cols, iSurgeMax),
+                        SurgeMin = GetString(cols, iSurgeMin),
+                        UsId = GetString(cols, iUsId),
+                        DsId = GetString(cols, iDsId),
+                        ElevationUs = GetString(cols, iElevUs),
+                        ElevationDs = GetString(cols, iElevDs),
+                        Roughness = GetString(cols, iRough),
+                        Length = GetString(cols, iLen),
+                        UsX = GetString(cols, iUsX),
+                        UsY = GetString(cols, iUsY),
+                        DsX = GetString(cols, iDsX),
+                        DsY = GetString(cols, iDsY),
+                        Vertices = GetString(cols, iVerts),
+                        PipeId = GetString(cols, iPipeId),
+                        SystemType = GetString(cols, iSysType),
+                        PipeStatus = GetString(cols, iStatus),
+                        Lining = GetString(cols, iLining),
+                        JointType = GetString(cols, iJoint),
+                        InstallYear = GetString(cols, iYear),
+                        VelocityFlag = GetString(cols, iVelFlag),
+                        SurgeFlag = GetString(cols, iSurgeFlag),
+                        Civil3dPnClass = GetString(cols, iPnClass),
+                        Notes = GetString(cols, iNotes),
+                    };
+
+                    if (!string.IsNullOrEmpty(r.UsId) && !string.IsNullOrEmpty(r.DsId))
+                        records.Add(r);
+                }
+            }
+
+            return records;
+        }
+
         private static string[] SplitCsvLine(string line)
         {
             // Simple split; adjust if WSPro exports quoted commas.
