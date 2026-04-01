@@ -120,19 +120,30 @@ namespace C3DPlugin
         {
             var pipes = new List<RawPipe>();
 
-            // Get PipeIds collection from the network
-            var pipeIds = GetObjectIdCollection(network, "PipeIds", "GetPipeIds");
+            // Try multiple known property/method names for pipe IDs
+            var pipeIds = GetObjectIdCollection(network, "PipeIds", "GetPipeIds")
+                       ?? GetObjectIdCollection(network, "PressurePipeIds", "GetPressurePipeIds")
+                       ?? GetObjectIdCollection(network, "LinePipeIds", "GetLinePipeIds");
+
             if (pipeIds == null)
             {
-                ed.WriteMessage("\nCould not find PipeIds on network. Probing...");
+                ed.WriteMessage("\nCould not find PipeIds on network. Probing all properties...");
+
+                // Dump all properties/methods on the network for diagnostics
+                DumpNetworkMembers(network, ed);
+
                 pipeIds = ProbeForObjectIds(network, tr, "Pipe");
+                if (pipeIds == null)
+                    pipeIds = ProbeForObjectIds(network, tr, "Line");
             }
 
             if (pipeIds == null || pipeIds.Count == 0)
             {
-                ed.WriteMessage("\nNo pipes found in network.");
+                ed.WriteMessage("\nNo pipes found in network after probing.");
                 return pipes;
             }
+
+            ed.WriteMessage($"\nFound {pipeIds.Count} pipe IDs.");
 
             foreach (ObjectId pipeId in pipeIds)
             {
@@ -150,12 +161,18 @@ namespace C3DPlugin
                     PropertyExtractor.TryGetLength(pipeObj, out double len);
                     string material = PropertyExtractor.GetMaterialCode(pipeObj, tr);
 
+                    // Diagnostic for first pipe (can be removed later)
+                    if (pipes.Count == 0)
+                        ed.WriteMessage($"\n  First pipe: dia={dia}m → {(dia < 10 ? dia * 1000 : dia)}mm, len={len}");
+
                     pipes.Add(new RawPipe
                     {
                         EntityId = pipeId,
                         StartPoint = startPt,
                         EndPoint = endPt,
-                        DiameterMm = dia,
+                        // Civil 3D stores diameter in drawing units (meters for metric).
+                        // Convert to mm if value looks like meters (< 10).
+                        DiameterMm = dia < 10 ? dia * 1000 : dia,
                         Length = len > 0 ? len : startPt.DistanceTo(endPt),
                         Material = material
                     });
@@ -386,6 +403,56 @@ namespace C3DPlugin
             }
 
             return false;
+        }
+
+        private static void DumpNetworkMembers(DBObject network, Editor ed)
+        {
+            var type = network.GetType();
+            ed.WriteMessage($"\n  Network type: {type.FullName}");
+
+            // Properties that return ObjectIdCollection or IEnumerable
+            var props = type.GetProperties(BindingFlags.Instance | BindingFlags.Public)
+                .Where(p => p.GetIndexParameters().Length == 0)
+                .OrderBy(p => p.Name)
+                .ToList();
+
+            ed.WriteMessage($"\n  Properties ({props.Count}):");
+            foreach (var p in props.Take(30))
+            {
+                string val = "";
+                try
+                {
+                    var v = p.GetValue(network, null);
+                    if (v is ObjectIdCollection col)
+                        val = $"ObjectIdCollection(count={col.Count})";
+                    else if (v is IEnumerable enumerable && v is not string)
+                    {
+                        int count = 0;
+                        foreach (var _ in enumerable) count++;
+                        val = $"Enumerable(count={count})";
+                    }
+                    else
+                        val = v?.ToString() ?? "<null>";
+                }
+                catch { val = "<error>"; }
+                ed.WriteMessage($"\n    {p.Name} ({p.PropertyType.Name}) = {val}");
+            }
+
+            // Methods that take 0 args and return something
+            var methods = type.GetMethods(BindingFlags.Instance | BindingFlags.Public)
+                .Where(m => !m.IsSpecialName && m.GetParameters().Length == 0 && m.ReturnType != typeof(void))
+                .OrderBy(m => m.Name)
+                .ToList();
+
+            ed.WriteMessage($"\n  Methods ({methods.Count}):");
+            foreach (var m in methods.Where(m =>
+                m.Name.IndexOf("Pipe", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                m.Name.IndexOf("Fitting", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                m.Name.IndexOf("Get", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                m.Name.IndexOf("Id", StringComparison.OrdinalIgnoreCase) >= 0).Take(20))
+            {
+                ed.WriteMessage($"\n    {m.Name}() -> {m.ReturnType.Name}");
+            }
         }
 
         private static string GetNetworkName(DBObject network)
