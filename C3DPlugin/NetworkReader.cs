@@ -21,8 +21,15 @@ namespace C3DPlugin
     {
         private const double NodeTolerance = 0.01; // spatial clustering tolerance
 
-        public static List<WsproCsvRecord> ReadNetwork(Editor ed, Transaction tr, out int pipeCount, out int fittingCount)
+        public class ExportNode
         {
+            public string Id;
+            public double X, Y, Z;
+        }
+
+        public static List<WsproCsvRecord> ReadNetwork(Editor ed, Transaction tr, out int pipeCount, out int fittingCount, out List<ExportNode> exportNodes)
+        {
+            exportNodes = new List<ExportNode>();
             pipeCount = 0;
             fittingCount = 0;
 
@@ -53,51 +60,120 @@ namespace C3DPlugin
             var rawPipes = ReadPipes(netObj, tr, ed);
             pipeCount = rawPipes.Count;
 
-            // Collect all fitting positions
-            var fittingPositions = ReadFittingPositions(netObj, tr, ed);
-            fittingCount = fittingPositions.Count;
+            // Build fitting-based node map: FittingObjectId → (nodeId, position)
+            // Fittings become EPANET nodes. Pipes connect to fitting nodes.
+            var fittingNodeMap = new Dictionary<ObjectId, (int NodeId, Point3d Position)>();
+            int nextNodeId = 1;
 
-            ed.WriteMessage($"\nFound {pipeCount} pipes, {fittingCount} fittings in network.");
+            // Collect all fitting IDs referenced by pipes
+            var allFittingIds = new HashSet<ObjectId>();
+            foreach (var pipe in rawPipes)
+            {
+                if (!pipe.StartFittingId.IsNull) allFittingIds.Add(pipe.StartFittingId);
+                if (!pipe.EndFittingId.IsNull) allFittingIds.Add(pipe.EndFittingId);
+            }
 
-            // Generate node IDs by spatial clustering
-            var nodeMap = BuildNodeMap(rawPipes, fittingPositions);
-            ed.WriteMessage($"\nGenerated {nodeMap.Count} unique node IDs.");
+            // Resolve each fitting to a position and assign a node ID
+            foreach (var fitId in allFittingIds)
+            {
+                try
+                {
+                    var fitObj = tr.GetObject(fitId, OpenMode.ForRead);
+                    if (fitObj != null && PropertyExtractor.TryGetPosition(fitObj, out var pos))
+                        fittingNodeMap[fitId] = (nextNodeId++, pos);
+                }
+                catch { }
+            }
+
+            fittingCount = fittingNodeMap.Count;
+            ed.WriteMessage($"\nFound {pipeCount} pipes, {fittingCount} fittings as nodes.");
+
+            // For pipe endpoints with no fitting (dead ends), use spatial clustering
+            var orphanNodeMap = new Dictionary<int, Point3d>();
 
             // Build WsproCsvRecords
             var records = new List<WsproCsvRecord>();
             foreach (var pipe in rawPipes)
             {
-                string usId = FindNodeId(nodeMap, pipe.StartPoint);
-                string dsId = FindNodeId(nodeMap, pipe.EndPoint);
+                // Resolve start node: fitting position if available, else pipe endpoint
+                string usId;
+                Point3d usPoint;
+                if (!pipe.StartFittingId.IsNull && fittingNodeMap.TryGetValue(pipe.StartFittingId, out var startNode))
+                {
+                    usId = startNode.NodeId.ToString();
+                    usPoint = startNode.Position;
+                }
+                else
+                {
+                    int orphanId = FindOrCreateOrphanNode(pipe.StartPoint, orphanNodeMap, ref nextNodeId);
+                    usId = orphanId.ToString();
+                    usPoint = pipe.StartPoint;
+                }
+
+                // Resolve end node: fitting position if available, else pipe endpoint
+                string dsId;
+                Point3d dsPoint;
+                if (!pipe.EndFittingId.IsNull && fittingNodeMap.TryGetValue(pipe.EndFittingId, out var endNode))
+                {
+                    dsId = endNode.NodeId.ToString();
+                    dsPoint = endNode.Position;
+                }
+                else
+                {
+                    int orphanId = FindOrCreateOrphanNode(pipe.EndPoint, orphanNodeMap, ref nextNodeId);
+                    dsId = orphanId.ToString();
+                    dsPoint = pipe.EndPoint;
+                }
 
                 var record = new WsproCsvRecord
                 {
                     UsId = usId,
                     DsId = dsId,
-                    UsX = WsproCsvRecord.FmtCoord(pipe.StartPoint.X),
-                    UsY = WsproCsvRecord.FmtCoord(pipe.StartPoint.Y),
-                    DsX = WsproCsvRecord.FmtCoord(pipe.EndPoint.X),
-                    DsY = WsproCsvRecord.FmtCoord(pipe.EndPoint.Y),
-                    ElevationUs = WsproCsvRecord.Fmt(pipe.StartPoint.Z),
-                    ElevationDs = WsproCsvRecord.Fmt(pipe.EndPoint.Z),
+                    UsX = WsproCsvRecord.FmtCoord(usPoint.X),
+                    UsY = WsproCsvRecord.FmtCoord(usPoint.Y),
+                    DsX = WsproCsvRecord.FmtCoord(dsPoint.X),
+                    DsY = WsproCsvRecord.FmtCoord(dsPoint.Y),
+                    ElevationUs = WsproCsvRecord.Fmt(usPoint.Z),
+                    ElevationDs = WsproCsvRecord.Fmt(dsPoint.Z),
                     Diameter = WsproCsvRecord.Fmt(pipe.DiameterMm, 0),
                     Length = WsproCsvRecord.Fmt(pipe.Length),
                     Material = pipe.Material,
-                    PipeId = $"{usId}_{dsId}",
+                    PipeId = "1",
                     PipeStatus = "open",
-                    Vertices = $"{WsproCsvRecord.FmtCoord(pipe.StartPoint.X)} {WsproCsvRecord.FmtCoord(pipe.StartPoint.Y)}|{WsproCsvRecord.FmtCoord(pipe.EndPoint.X)} {WsproCsvRecord.FmtCoord(pipe.EndPoint.Y)}",
-
-                    // Invert levels: centerline Z - radius
-                    UsIl = WsproCsvRecord.Fmt(pipe.StartPoint.Z - (pipe.DiameterMm / 2000.0)),
-                    DsIl = WsproCsvRecord.Fmt(pipe.EndPoint.Z - (pipe.DiameterMm / 2000.0)),
+                    Vertices = $"{WsproCsvRecord.FmtCoord(usPoint.X)} {WsproCsvRecord.FmtCoord(usPoint.Y)}|{WsproCsvRecord.FmtCoord(dsPoint.X)} {WsproCsvRecord.FmtCoord(dsPoint.Y)}",
+                    UsIl = WsproCsvRecord.Fmt(usPoint.Z - (pipe.DiameterMm / 2000.0)),
+                    DsIl = WsproCsvRecord.Fmt(dsPoint.Z - (pipe.DiameterMm / 2000.0)),
                 };
 
-                // Read PropertySet values for round-trip (simulation data from previous import)
                 if (!pipe.EntityId.IsNull)
                     PropertySetManager.ReadValues(pipe.EntityId, tr, record);
 
                 records.Add(record);
             }
+
+            // Build export nodes from fittings + dead-end nodes
+            foreach (var kvp in fittingNodeMap.OrderBy(k => k.Value.NodeId))
+            {
+                exportNodes.Add(new ExportNode
+                {
+                    Id = kvp.Value.NodeId.ToString(),
+                    X = kvp.Value.Position.X,
+                    Y = kvp.Value.Position.Y,
+                    Z = kvp.Value.Position.Z
+                });
+            }
+            foreach (var kvp in orphanNodeMap.OrderBy(k => k.Key))
+            {
+                exportNodes.Add(new ExportNode
+                {
+                    Id = kvp.Key.ToString(),
+                    X = kvp.Value.X,
+                    Y = kvp.Value.Y,
+                    Z = kvp.Value.Z
+                });
+            }
+
+            ed.WriteMessage($"\nGenerated {exportNodes.Count} nodes ({fittingNodeMap.Count} from fittings, {orphanNodeMap.Count} dead-ends).");
 
             return records;
         }
@@ -109,6 +185,8 @@ namespace C3DPlugin
             public ObjectId EntityId;
             public Point3d StartPoint;
             public Point3d EndPoint;
+            public ObjectId StartFittingId;
+            public ObjectId EndFittingId;
             public double DiameterMm;
             public double Length;
             public string Material;
@@ -158,22 +236,48 @@ namespace C3DPlugin
                     if (!PropertyExtractor.TryGetEndPoint(pipeObj, out var endPt)) continue;
 
                     PropertyExtractor.TryGetDiameter(pipeObj, tr, out double dia);
-                    PropertyExtractor.TryGetLength(pipeObj, out double len);
                     string material = PropertyExtractor.GetMaterialCode(pipeObj, tr);
 
-                    // Diagnostic for first pipe (can be removed later)
-                    if (pipes.Count == 0)
-                        ed.WriteMessage($"\n  First pipe: dia={dia}m → {(dia < 10 ? dia * 1000 : dia)}mm, len={len}");
+                    // Get center-to-center length (preferred for EPANET)
+                    PropertyExtractor.TryGetDouble(pipeObj, "Length2DCenterToCenter", out double lenC2C);
+                    PropertyExtractor.TryGetLength(pipeObj, out double len);
+                    double finalLen = lenC2C > 0 ? lenC2C : (len > 0 ? len : startPt.DistanceTo(endPt));
+
+                    // Get fitting IDs at each end
+                    ObjectId startFitId = ObjectId.Null;
+                    ObjectId endFitId = ObjectId.Null;
+                    try
+                    {
+                        if (PropertyExtractor.TryGetString(pipeObj, "StartFittingId", out var sfStr)) { }
+                        var sfProp = pipeObj.GetType().GetProperty("StartFittingId", BindingFlags.Instance | BindingFlags.Public);
+                        if (sfProp != null) { var v = sfProp.GetValue(pipeObj, null); if (v is ObjectId oid) startFitId = oid; }
+
+                        var efProp = pipeObj.GetType().GetProperty("EndFittingId", BindingFlags.Instance | BindingFlags.Public);
+                        if (efProp != null) { var v = efProp.GetValue(pipeObj, null); if (v is ObjectId oid) endFitId = oid; }
+
+                        // Also try StartPartId / EndPartId as fallback
+                        if (startFitId.IsNull)
+                        {
+                            var spProp = pipeObj.GetType().GetProperty("StartPartId", BindingFlags.Instance | BindingFlags.Public);
+                            if (spProp != null) { var v = spProp.GetValue(pipeObj, null); if (v is ObjectId oid && !oid.IsNull) startFitId = oid; }
+                        }
+                        if (endFitId.IsNull)
+                        {
+                            var epProp = pipeObj.GetType().GetProperty("EndPartId", BindingFlags.Instance | BindingFlags.Public);
+                            if (epProp != null) { var v = epProp.GetValue(pipeObj, null); if (v is ObjectId oid && !oid.IsNull) endFitId = oid; }
+                        }
+                    }
+                    catch { }
 
                     pipes.Add(new RawPipe
                     {
                         EntityId = pipeId,
                         StartPoint = startPt,
                         EndPoint = endPt,
-                        // Civil 3D stores diameter in drawing units (meters for metric).
-                        // Convert to mm if value looks like meters (< 10).
+                        StartFittingId = startFitId,
+                        EndFittingId = endFitId,
                         DiameterMm = dia < 10 ? dia * 1000 : dia,
-                        Length = len > 0 ? len : startPt.DistanceTo(endPt),
+                        Length = finalLen,
                         Material = material
                     });
                 }
@@ -211,7 +315,24 @@ namespace C3DPlugin
             return positions;
         }
 
-        // ── Node ID generation via spatial clustering ──
+        // ── Orphan node handling (dead-end pipe endpoints with no fitting) ──
+
+        private static int FindOrCreateOrphanNode(Point3d point, Dictionary<int, Point3d> orphanMap, ref int nextId)
+        {
+            // Check if an existing orphan node is close enough
+            foreach (var kvp in orphanMap)
+            {
+                if (Distance2D(point, kvp.Value) < NodeTolerance)
+                    return kvp.Key;
+            }
+
+            // Create new orphan node
+            int id = nextId++;
+            orphanMap[id] = point;
+            return id;
+        }
+
+        // ── Node ID generation via spatial clustering (kept for backward compat) ──
 
         private static Dictionary<int, Point3d> BuildNodeMap(List<RawPipe> pipes, List<Point3d> fittingPositions)
         {

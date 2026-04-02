@@ -32,7 +32,7 @@ namespace C3DPlugin
 
             using (var tr = doc.TransactionManager.StartTransaction())
             {
-                var records = NetworkReader.ReadNetwork(ed, tr, out int pipeCount, out int fittingCount);
+                var records = NetworkReader.ReadNetwork(ed, tr, out int pipeCount, out int fittingCount, out var exportNodes);
 
                 if (records.Count == 0)
                 {
