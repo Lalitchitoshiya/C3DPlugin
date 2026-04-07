@@ -218,6 +218,7 @@ namespace C3DPlugin
                 // (Callable separately via WSPRO_DIAG_PARTS as well.)
 
                 // Prefer reusing an existing Pressure Pipe Network if one already exists in the drawing.
+                bool isNewNetwork = false;
                 if (!TryGetExistingPressureNetwork(civilDoc, tr, ed, out ObjectId networkId))
                 {
                     if (!TryCreatePressureNetwork(civilDoc, "WSPro_Import", partsListId, ed, out networkId))
@@ -225,6 +226,7 @@ namespace C3DPlugin
                         tr.Commit();
                         return;
                     }
+                    isNewNetwork = true; // Fresh import — fittings need to be created
                 }
 
                 if (networkId.IsNull)
@@ -308,73 +310,80 @@ namespace C3DPlugin
                 int fittingsCreated = 0;
                 int fittingsSkipped = 0;
 
-                // Check if fitting parts are available; try to auto-add from catalog if missing
-                bool hasFittings = false;
-                if (TryOpenPressurePartList(partsListId, tr, out var checkList))
-                    hasFittings = GetFittingParts(checkList, tr).Any();
-
-                if (!hasFittings)
+                if (isNewNetwork)
                 {
-                    ed.WriteMessage("\nNo fitting parts in current parts list. Trying to add from catalog...");
-                    hasFittings = TryAutoAddFittingsFromCatalog(partsListId, networkId, tr, ed);
-                }
+                    // Fresh import — no existing fittings, create them
+                    bool hasFittings = false;
+                    if (TryOpenPressurePartList(partsListId, tr, out var checkList))
+                        hasFittings = GetFittingParts(checkList, tr).Any();
 
-                if (hasFittings)
-                {
-                    foreach (var kvp in nodeConnectionCount)
+                    if (!hasFittings)
                     {
-                        int connCount = kvp.Value;
-                        if (connCount < 2)
-                            continue;
+                        ed.WriteMessage("\nNo fitting parts in current parts list. Trying to add from catalog...");
+                        hasFittings = TryAutoAddFittingsFromCatalog(partsListId, networkId, tr, ed);
+                    }
 
-                        if (!nodeDict.TryGetValue(kvp.Key, out var node))
-                            continue;
-
-                        var point = new Point3d(node.X, node.Y, node.Z);
-                        double diamMm = nodeMaxDiameterMm.GetValueOrDefault(kvp.Key, 0);
-
-                        if (!TryFindFittingPartSize(partsListId, tr, connCount, diamMm, out PressurePartSize fittingSize))
+                    if (hasFittings)
+                    {
+                        foreach (var kvp in nodeConnectionCount)
                         {
-                            fittingsSkipped++;
-                            continue;
-                        }
+                            int connCount = kvp.Value;
+                            if (connCount < 2)
+                                continue;
 
-                        try
-                        {
-                            if (TryAddFitting(networkId, tr, point, fittingSize, ed, out ObjectId fittingId) && !fittingId.IsNull)
+                            if (!nodeDict.TryGetValue(kvp.Key, out var node))
+                                continue;
+
+                            var point = new Point3d(node.X, node.Y, node.Z);
+                            double diamMm = nodeMaxDiameterMm.GetValueOrDefault(kvp.Key, 0);
+
+                            if (!TryFindFittingPartSize(partsListId, tr, connCount, diamMm, out PressurePartSize fittingSize))
                             {
-                                fittingsCreated++;
-
-                                // Rotate fitting to align with connecting pipes
-                                if (nodeDirections.TryGetValue(kvp.Key, out var dirs) && dirs.Count >= 2)
-                                    TryRotateFitting(fittingId, tr, dirs, ed);
-                            }
-                            else
                                 fittingsSkipped++;
+                                continue;
+                            }
+
+                            try
+                            {
+                                if (TryAddFitting(networkId, tr, point, fittingSize, ed, out ObjectId fittingId) && !fittingId.IsNull)
+                                {
+                                    fittingsCreated++;
+
+                                    // Rotate fitting to align with connecting pipes
+                                    if (nodeDirections.TryGetValue(kvp.Key, out var dirs) && dirs.Count >= 2)
+                                        TryRotateFitting(fittingId, tr, dirs, ed);
+                                }
+                                else
+                                    fittingsSkipped++;
+                            }
+                            catch
+                            {
+                                fittingsSkipped++;
+                            }
                         }
-                        catch
-                        {
-                            fittingsSkipped++;
-                        }
+                    }
+                    else
+                    {
+                        int junctionNodes = nodeConnectionCount.Count(kvp => kvp.Value >= 2);
+                        fittingsSkipped = junctionNodes;
+
+                        ed.WriteMessage($"\n{junctionNodes} junction nodes need fittings but no fitting parts are available.");
+                        ed.WriteMessage("\nTo fix: In Civil 3D Toolspace > Settings > Pressure Networks > Parts Lists >");
+                        ed.WriteMessage("\n  Right-click your parts list > Edit > Add Part Family > add Tee, Elbow, Cross families.");
+                        ed.WriteMessage("\nThen re-run WSPRO_IMPORT_PRESSURE to place fittings at junctions.");
                     }
                 }
                 else
                 {
-                    // No fittings available from parts list or catalog - try direct pipe-end connection
-                    int junctionNodes = nodeConnectionCount.Count(kvp => kvp.Value >= 2);
-                    fittingsSkipped = junctionNodes;
-
-                    ed.WriteMessage($"\n{junctionNodes} junction nodes need fittings but no fitting parts are available.");
-                    ed.WriteMessage("\nTo fix: In Civil 3D Toolspace > Settings > Pressure Networks > Parts Lists >");
-                    ed.WriteMessage("\n  Right-click your parts list > Edit > Add Part Family > add Tee, Elbow, Cross families.");
-                    ed.WriteMessage("\nThen re-run WSPRO_IMPORT_PRESSURE to place fittings at junctions.");
+                    // Re-import — existing network already has fittings, skip placement
+                    ed.WriteMessage("\nSkipping fitting placement — using existing fittings from network.");
                 }
 
                 ed.WriteMessage($"\nCreated {pipeCreated} pressure pipes in network 'WSPro_Import'.");
                 if (fittingsCreated > 0)
                     ed.WriteMessage($"\nCreated {fittingsCreated} fittings at junction nodes.");
-                if (fittingsSkipped > 0 && hasFittings)
-                    ed.WriteMessage($"\nSkipped {fittingsSkipped} fittings (no matching part size or placement failed). Run WSPRO_DIAG_PARTS to check available fitting sizes.");
+                if (fittingsSkipped > 0)
+                    ed.WriteMessage($"\nSkipped {fittingsSkipped} fittings (no matching part size or placement failed).");
                 if (pipeSkippedMissingNode > 0)
                     ed.WriteMessage($"\nSkipped {pipeSkippedMissingNode} pipes due to missing node IDs.");
                 if (pipeSkippedNoSize > 0)
